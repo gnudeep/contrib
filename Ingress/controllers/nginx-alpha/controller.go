@@ -40,17 +40,18 @@ http {
   server_names_hash_max_size 512;
   server_names_hash_bucket_size 64;
 
-{{range $ing := .Items}}
-{{range $rule := $ing.Spec.Rules}}
   server {
     listen 80;
-    server_name {{$rule.Host}};
+    server_name newapps.cloudstaging.wso2.com;
+
+{{range $ing := .Items}}
+{{range $rule := $ing.Spec.Rules}}
 {{ range $path := $rule.HTTP.Paths }}
-    location {{$path.Path}} {
-      proxy_set_header Host $host;
-      proxy_pass http://{{$path.Backend.ServiceName}}.{{$ing.Namespace}}.svc.cluster.local;
+    location {{$path.Path}}/ {
+      proxy_pass http://{{$path.Backend.ServiceName}}.{{$ing.Namespace}}.svc.cluster.local/;
     }{{end}}
-  }{{end}}{{end}}
+{{end}}{{end}}
+  }
 }`
 )
 
