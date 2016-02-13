@@ -51,10 +51,16 @@ type Histogram map[string]float64
 // ResourceToHistogram is a map from resource names (e.g. "pods") to the relevant latency data
 type ResourceToHistogram map[string][]APICallLatency
 
+// TestToHistogram is a map from test name to ResourceToHistogram
+type TestToHistogram map[string]ResourceToHistogram
+
 // BuildLatencyData is a map from build number to latency data
 type BuildLatencyData map[string]ResourceToHistogram
 
-func (buildLatency *BuildLatencyData) ServeHTTP(res http.ResponseWriter, req *http.Request) {
+// TestToBuildData is a map from test name to BuildLatencyData
+type TestToBuildData map[string]BuildLatencyData
+
+func (buildLatency *TestToBuildData) ServeHTTP(res http.ResponseWriter, req *http.Request) {
 	data, err := json.Marshal(buildLatency)
 	if err != nil {
 		res.Header().Set("Content-type", "text/html")
@@ -67,8 +73,69 @@ func (buildLatency *BuildLatencyData) ServeHTTP(res http.ResponseWriter, req *ht
 	res.Write(data)
 }
 
-func getLatencyData(client *jenkins.JenkinsClient, job string) (BuildLatencyData, sets.String, sets.String, error) {
-	buildLatency := BuildLatencyData{}
+const (
+	scanning   = iota
+	inTest     = iota
+	processing = iota
+)
+
+var descriptionToName = map[string]string{
+	"should allow starting 30 pods per node":    "Density",
+	"should be able to handle 30 pods per node": "Load",
+}
+
+// Assumes that *resources* and *methods* are already initialized.
+func parseTestOutput(scanner *bufio.Scanner, buildNumber int, resources sets.String, methods sets.String) TestToHistogram {
+	buff := &bytes.Buffer{}
+	hist := TestToHistogram{}
+	state := scanning
+	testNameSeparator := "[It] [Feature:Performance]"
+	testName := ""
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.Contains(line, testNameSeparator) {
+			state = inTest
+			var ok bool
+			testName, ok = descriptionToName[strings.Trim(strings.Split(line, testNameSeparator)[1], " ")]
+			if !ok {
+				testName = "Unknown"
+			}
+			hist[testName] = make(ResourceToHistogram)
+		}
+		if state == processing {
+			// TODO: This is brittle, we should emit a tail delimiter too
+			if strings.Contains(line, "INFO") || strings.Contains(line, "STEP") || strings.Contains(line, "Failure") || strings.Contains(line, "[AfterEach]") {
+				obj := LatencyData{}
+				if err := json.Unmarshal(buff.Bytes(), &obj); err != nil {
+					fmt.Printf("error parsing JSON in build %d: %v %s\n", buildNumber, err, buff.String())
+					// reset state and try again with more input
+					state = scanning
+					continue
+				}
+
+				for _, call := range obj.APICalls {
+					hist[testName][call.Resource] = append(hist[testName][call.Resource], call)
+					resources.Insert(call.Resource)
+					methods.Insert(call.Verb)
+				}
+
+				buff.Reset()
+				state = scanning
+			}
+		}
+		if state == inTest && strings.Contains(line, "API calls latencies") {
+			state = processing
+			line = line[strings.Index(line, "{"):]
+		}
+		if state == processing {
+			buff.WriteString(line + " ")
+		}
+	}
+	return hist
+}
+
+func getLatencyData(client *jenkins.JenkinsClient, job string) (TestToBuildData, sets.String, sets.String, error) {
+	buildLatency := TestToBuildData{}
 	resources := sets.NewString()
 	methods := sets.NewString()
 
@@ -79,65 +146,24 @@ func getLatencyData(client *jenkins.JenkinsClient, job string) (BuildLatencyData
 
 	for ix := range queue.Builds {
 		build := queue.Builds[ix]
+		if build.Number < *startFrom {
+			continue
+		}
 		reader, err := client.GetConsoleLog(job, build.Number)
 		if err != nil {
-			fmt.Printf("error getting logs: %v", err)
+			fmt.Printf("error getting logs: %v\n", err)
 			continue
 		}
 		defer reader.Close()
 		scanner := bufio.NewScanner(reader)
-		buff := &bytes.Buffer{}
-		inLatency := false
+		hist := parseTestOutput(scanner, build.Number, resources, methods)
 
-		hist := ResourceToHistogram{}
-		found := false
-		testNameSeparator := "[It] [Skipped] [Performance suite]"
-		testName := ""
-		for scanner.Scan() {
-			line := scanner.Text()
-			if strings.Contains(line, testNameSeparator) {
-				testName = strings.Trim(strings.Split(line, testNameSeparator)[1], " ")
+		for k, v := range hist {
+			if _, ok := buildLatency[k]; !ok {
+				buildLatency[k] = make(BuildLatencyData)
 			}
-			// TODO: This is brittle, we should emit a tail delimiter too
-			if strings.Contains(line, "INFO") || strings.Contains(line, "STEP") || strings.Contains(line, "Failure") {
-				if inLatency {
-					obj := LatencyData{}
-					if err := json.Unmarshal(buff.Bytes(), &obj); err != nil {
-						fmt.Printf("error parsing JSON in build %d: %v %s\n", build.Number, err, buff.String())
-						// reset state and try again with more input
-						inLatency = false
-						continue
-					}
-
-					if testName == "should allow starting 30 pods per node" {
-						for _, call := range obj.APICalls {
-							list := hist[call.Resource]
-							list = append(list, call)
-							hist[call.Resource] = list
-							resources.Insert(call.Resource)
-							methods.Insert(call.Verb)
-						}
-					}
-
-					buff.Reset()
-				}
-				inLatency = false
-			}
-			if strings.Contains(line, "API calls latencies") {
-				found = true
-				inLatency = true
-				ix = strings.Index(line, "{")
-				line = line[ix:]
-			}
-			if inLatency {
-				buff.WriteString(line + " ")
-			}
+			buildLatency[k][fmt.Sprintf("%d", build.Number)] = v
 		}
-		if !found {
-			continue
-		}
-
-		buildLatency[fmt.Sprintf("%d", build.Number)] = hist
 	}
 	return buildLatency, resources, methods, nil
 }
@@ -187,6 +213,7 @@ var (
 	addr        = flag.String("address", ":8080", "The address to serve web data on, only used if -www is true")
 	wwwDir      = flag.String("dir", "", "If non-empty, add a file server for this directory at the root of the web server")
 	jenkinsHost = flag.String("jenkins-host", "", "The URL for the jenkins server.")
+	startFrom   = flag.Int("start-from", 0, "First build number to include in the results")
 
 	pollDuration = 10 * time.Minute
 	errorDelay   = 10 * time.Second
@@ -205,11 +232,13 @@ func main() {
 			fmt.Printf("Failed to get data: %v\n", err)
 			os.Exit(1)
 		}
-		generateCSV(buildLatency, resources, methods, os.Stdout)
+		for _, v := range buildLatency {
+			generateCSV(v, resources, methods, os.Stdout)
+		}
 		return
 	}
 
-	buildLatency := BuildLatencyData{}
+	buildLatency := TestToBuildData{}
 	resources := sets.String{}
 	methods := sets.String{}
 	var err error

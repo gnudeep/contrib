@@ -19,6 +19,7 @@ package mungers
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"sort"
 	"strconv"
@@ -44,6 +45,11 @@ const (
 	jenkinsUnitContext = "Jenkins unit/integration"
 	travisContext      = "continuous-integration/travis-ci/pr"
 	sqContext          = "Submit Queue"
+
+	highestMergePriority = -1 // used for e2e-not-required
+	defaultMergePriority = 3  // when an issue is unlabeled
+
+	githubE2EPollTime = 30 * time.Second
 )
 
 var (
@@ -114,11 +120,12 @@ type SubmitQueue struct {
 	statusHistory []submitStatus          // protected by sync.Mutex
 
 	// Every time a PR is added to githubE2EQueue also notify the channel
-	githubE2EWakeup  chan bool
-	githubE2ERunning *github.MungeObject         // protect by sync.Mutex!
-	githubE2EQueue   map[int]*github.MungeObject // protected by sync.Mutex!
+	githubE2ERunning  *github.MungeObject         // protect by sync.Mutex!
+	githubE2EQueue    map[int]*github.MungeObject // protected by sync.Mutex!
+	githubE2EPollTime time.Duration
 
-	e2e *e2e.E2ETester
+	lastE2EStable bool // was e2e stable last time they were checked, protect by sync.Mutex
+	e2e           *e2e.E2ETester
 }
 
 func init() {
@@ -138,10 +145,11 @@ func (sq *SubmitQueue) Initialize(config *github.Config) error {
 		glog.Fatalf("--jenkins-host is required.")
 	}
 
+	sq.lastE2EStable = true
 	e2e := &e2e.E2ETester{
 		JenkinsJobs: sq.JenkinsJobs,
 		JenkinsHost: sq.JenkinsHost,
-		BuildStatus: map[string]string{},
+		BuildStatus: map[string]e2e.BuildInfo{},
 	}
 	sq.e2e = e2e
 	if len(sq.Address) > 0 {
@@ -171,8 +179,10 @@ func (sq *SubmitQueue) Initialize(config *github.Config) error {
 	sq.prStatus = map[string]submitStatus{}
 	sq.lastPRStatus = map[string]submitStatus{}
 
-	sq.githubE2EWakeup = make(chan bool, 1000)
 	sq.githubE2EQueue = map[int]*github.MungeObject{}
+	if sq.githubE2EPollTime == 0 {
+		sq.githubE2EPollTime = githubE2EPollTime
+	}
 
 	go sq.handleGithubE2EAndMerge()
 	go sq.updateGoogleE2ELoop()
@@ -192,17 +202,17 @@ func (sq *SubmitQueue) EachLoop() error {
 // AddFlags will add any request flags to the cobra `cmd`
 func (sq *SubmitQueue) AddFlags(cmd *cobra.Command, config *github.Config) {
 	cmd.Flags().StringSliceVar(&sq.JenkinsJobs, "jenkins-jobs", []string{
-		"kubernetes-e2e-gce",
-		"kubernetes-e2e-gke-ci",
 		"kubernetes-build",
-		"kubernetes-e2e-gce-parallel",
-		"kubernetes-e2e-gce-autoscaling",
-		"kubernetes-e2e-gce-reboot",
+		"kubernetes-test-go",
+		"kubernetes-e2e-gce",
+		"kubernetes-e2e-gce-slow",
+		"kubernetes-e2e-gke",
+		"kubernetes-e2e-gke-slow",
 		"kubernetes-e2e-gce-scalability",
 		"kubernetes-kubemark-gce",
 	}, "Comma separated list of jobs in Jenkins to use for stability testing")
 	cmd.Flags().StringVar(&sq.JenkinsHost, "jenkins-host", "http://jenkins-master:8080", "The URL for the jenkins job to watch")
-	cmd.Flags().StringSliceVar(&sq.RequiredStatusContexts, "required-contexts", []string{travisContext}, "Comma separate list of status contexts required for a PR to be considered ok to merge")
+	cmd.Flags().StringSliceVar(&sq.RequiredStatusContexts, "required-contexts", []string{}, "Comma separate list of status contexts required for a PR to be considered ok to merge")
 	cmd.Flags().StringVar(&sq.Address, "address", ":8080", "The address to listen on for HTTP Status")
 	cmd.Flags().StringVar(&sq.E2EStatusContext, "e2e-status-context", jenkinsE2EContext, "The name of the github status context for the e2e PR Builder")
 	cmd.Flags().StringVar(&sq.UnitStatusContext, "unit-status-context", jenkinsUnitContext, "The name of the github status context for the unit PR Builder")
@@ -210,13 +220,46 @@ func (sq *SubmitQueue) AddFlags(cmd *cobra.Command, config *github.Config) {
 	sq.addWhitelistCommand(cmd, config)
 }
 
+func (sq *SubmitQueue) e2eStable() bool {
+	wentStable := false
+	wentUnstable := false
+
+	stable := sq.e2e.Stable()
+
+	sq.Lock()
+	last := sq.lastE2EStable
+	if last && !stable {
+		wentUnstable = true
+	} else if !last && stable {
+		wentStable = true
+
+	}
+	sq.lastE2EStable = stable
+	sq.Unlock()
+
+	reason := ""
+	if wentStable {
+		reason = e2eRecover
+	} else if wentUnstable {
+		reason = e2eFailure
+	}
+	if reason != "" {
+		submitStatus := submitStatus{
+			Time:   time.Now(),
+			Reason: reason,
+		}
+		sq.Lock()
+		sq.statusHistory = append(sq.statusHistory, submitStatus)
+		sq.Unlock()
+	}
+	return stable
+}
+
 // This serves little purpose other than to show updates every minute in the
 // web UI. Stable() will get called as needed against individual PRs as well.
 func (sq *SubmitQueue) updateGoogleE2ELoop() {
 	for {
-		if !sq.e2e.Stable() {
-			sq.flushGithubE2EQueue(e2eFailure)
-		}
+		_ = sq.e2eStable()
 		time.Sleep(1 * time.Minute)
 	}
 
@@ -255,7 +298,7 @@ func reasonToState(reason string) string {
 }
 
 // SetMergeStatus will set the status given a particular PR. This function should
-// but used instead of manipulating the prStatus directly as sq.Lock() must be
+// be used instead of manipulating the prStatus directly as sq.Lock() must be
 // called when manipulating that structure
 // `obj` is the active github object
 // `reason` is the new 'status' for this object
@@ -379,6 +422,7 @@ const (
 	undeterminedMergability = "Unable to determine is PR is mergeable. Will try again later."
 	ciFailure               = "Github CI tests are not green."
 	e2eFailure              = "The e2e tests are failing. The entire submit queue is blocked."
+	e2eRecover              = "The e2e tests started passing. The submit queue is unblocked."
 	merged                  = "MERGED!"
 	ghE2EQueued             = "Queued to run github e2e tests a second time."
 	ghE2EWaitingStart       = "Requested and waiting for github e2e test to start running a second time."
@@ -403,7 +447,6 @@ func (sq *SubmitQueue) Munge(obj *github.MungeObject) {
 		return
 	}
 
-	e2e := sq.e2e
 	userSet := sq.userWhitelist
 
 	if !obj.HasLabels([]string{claYes}) && !obj.HasLabels([]string{claHuman}) {
@@ -460,26 +503,16 @@ func (sq *SubmitQueue) Munge(obj *github.MungeObject) {
 		return
 	}
 
-	if !e2e.Stable() {
-		sq.flushGithubE2EQueue(e2eFailure)
-		sq.SetMergeStatus(obj, e2eFailure, false)
-		return
-	}
-
-	// if there is a 'e2e-not-required' label, just merge it.
-	if obj.HasLabel(e2eNotRequiredLabel) {
-		obj.MergePR("submit-queue")
-		sq.SetMergeStatus(obj, merged, true)
-		return
-	}
-
 	added := false
 	sq.Lock()
 	if _, ok := sq.githubE2EQueue[*obj.Issue.Number]; !ok {
-		sq.githubE2EQueue[*obj.Issue.Number] = obj
-		sq.githubE2EWakeup <- true
 		added = true
 	}
+	// Add this most-recent object in place of the existing object. It will
+	// have more up2date information. Even though we explicitly refresh the
+	// PR information before do anything with it, this allow things like the
+	// queue order to change dynamically as labels are added/removed.
+	sq.githubE2EQueue[*obj.Issue.Number] = obj
 	sq.Unlock()
 	if added {
 		sq.SetMergeStatus(obj, ghE2EQueued, true)
@@ -488,60 +521,97 @@ func (sq *SubmitQueue) Munge(obj *github.MungeObject) {
 	return
 }
 
-// If the PR was put in the github e2e queue on a current pass, but now we don't
+// If the PR was put in the github e2e queue previously, but now we don't
 // think it should be in the e2e queue, remove it. MUST be called with sq.Lock()
 // held.
 func (sq *SubmitQueue) cleanupOldE2E(obj *github.MungeObject, reason string) {
 	switch reason {
+	case e2eFailure:
 	case ghE2EQueued:
 	case ghE2EWaitingStart:
 	case ghE2ERunning:
 		// Do nothing
+	case ciFailure:
+		// ciFailure is intersting. If the PR is being actively retested and then the
+		// time based loop finds the same PR it will try to set ciFailure. We should in fact
+		// not ever call this function in this case, but if we do call here, log it.
+		if sq.githubE2ERunning != nil && *sq.githubE2ERunning.Issue.Number == *obj.Issue.Number {
+			glog.Errorf("Trying to clean up %d due to ciFailure while it is being tested")
+			return
+		}
+		fallthrough
 	default:
+		if sq.githubE2ERunning != nil && *sq.githubE2ERunning.Issue.Number == *obj.Issue.Number {
+			sq.githubE2ERunning = nil
+		}
 		delete(sq.githubE2EQueue, *obj.Issue.Number)
 	}
 
 }
 
-// flushGithubE2EQueue will rmeove all entries from the build queue and will mark them
-// as failed with the given reason. We do not need to flush the githubE2EWakeup
-// channel as that just causes handleGithubE2EAndMerge() to wake up. And if it
-// wakes up a few extra times, who cares.
-func (sq *SubmitQueue) flushGithubE2EQueue(reason string) {
-	objs := []*github.MungeObject{}
-	sq.Lock()
-	for _, obj := range sq.githubE2EQueue {
-		objs = append(objs, obj)
+func priority(obj *github.MungeObject) int {
+	// jump to the front of the queue if you don't need retested
+	if obj.HasLabel(e2eNotRequiredLabel) {
+		return highestMergePriority
 	}
-	sq.Unlock()
-	for _, obj := range objs {
-		sq.SetMergeStatus(obj, reason, true)
+
+	prio := obj.Priority()
+	// eparis randomly decided that unlabel issues count at p3
+	if prio == math.MaxInt32 {
+		return defaultMergePriority
 	}
+	return prio
+}
+
+type queueSorter []*github.MungeObject
+
+func (s queueSorter) Len() int      { return len(s) }
+func (s queueSorter) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
+func (s queueSorter) Less(i, j int) bool {
+	a := s[i]
+	b := s[j]
+
+	aPrio := priority(a)
+	bPrio := priority(b)
+
+	if aPrio < bPrio {
+		return true
+	} else if aPrio > bPrio {
+		return false
+	}
+
+	return *a.Issue.Number < *b.Issue.Number
 }
 
 // sq.Lock() better held!!!
 func (sq *SubmitQueue) orderedE2EQueue() []int {
-	// Find and do the lowest PR number first
-	var keys []int
-	for k := range sq.githubE2EQueue {
-		keys = append(keys, k)
+	prs := []*github.MungeObject{}
+	for _, obj := range sq.githubE2EQueue {
+		prs = append(prs, obj)
 	}
-	sort.Ints(keys)
-	return keys
+	sort.Sort(queueSorter(prs))
+
+	var ordered []int
+	for _, obj := range prs {
+		ordered = append(ordered, *obj.Issue.Number)
+	}
+	return ordered
 }
 
 // handleGithubE2EAndMerge waits for PRs that are ready to re-run the github
 // e2e tests, runs the test, and then merges if everything was successful.
 func (sq *SubmitQueue) handleGithubE2EAndMerge() {
 	for {
+		sq.Lock()
+		l := len(sq.githubE2EQueue)
+		sq.Unlock()
 		// Wait until something is ready to be processed
-		select {
-		case _ = <-sq.githubE2EWakeup:
+		if l == 0 || !sq.e2eStable() {
+			time.Sleep(sq.githubE2EPollTime)
+			continue
 		}
 
 		sq.Lock()
-		// Could happen if the same PR was added twice. It will only be
-		// in the map one time, but it will be in the channel twice.
 		if len(sq.githubE2EQueue) == 0 {
 			sq.Unlock()
 			continue
@@ -563,7 +633,7 @@ func (sq *SubmitQueue) handleGithubE2EAndMerge() {
 }
 
 func (sq *SubmitQueue) doGithubE2EAndMerge(obj *github.MungeObject) {
-	_, err := obj.RefreshPR()
+	err := obj.Refresh()
 	if err != nil {
 		glog.Errorf("%d: unknown err: %v", *obj.Issue.Number, err)
 		sq.SetMergeStatus(obj, unknown, true)
@@ -584,6 +654,17 @@ func (sq *SubmitQueue) doGithubE2EAndMerge(obj *github.MungeObject) {
 		return
 	} else if !mergeable {
 		sq.SetMergeStatus(obj, unmergeable, true)
+		return
+	}
+
+	if !sq.e2eStable() {
+		sq.SetMergeStatus(obj, e2eFailure, true)
+		return
+	}
+
+	if obj.HasLabel(e2eNotRequiredLabel) {
+		obj.MergePR("submit-queue")
+		sq.SetMergeStatus(obj, merged, true)
 		return
 	}
 
@@ -618,8 +699,7 @@ func (sq *SubmitQueue) doGithubE2EAndMerge(obj *github.MungeObject) {
 		return
 	}
 
-	if !sq.e2e.Stable() {
-		sq.flushGithubE2EQueue(e2eFailure)
+	if !sq.e2eStable() {
 		sq.SetMergeStatus(obj, e2eFailure, true)
 		return
 	}

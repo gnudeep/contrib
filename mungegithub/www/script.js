@@ -11,14 +11,44 @@ function SQCntl(dataService, $interval, $location) {
   self.prQuerySearch = prQuerySearch;
   self.historyQuerySearch = historyQuerySearch;
   self.goToPerson = goToPerson;
+  self.selectTab = selectTab;
   self.queryNum = 0;
+  self.selected = 0;
   self.StatOrder = "-Count";
+  self.location = $location;
 
   // http://submit-queue.k8s.io/#?prDisplay=eparis&historyDisplay=15999
   //  will show all PRs opened by eparis and all historic decisions for PR #15999
-  var vars = $location.search()
-  self.prDisplayValue = vars.prDisplay
-  self.historyDisplayValue = vars.historyDisplay
+  var vars = $location.search();
+  self.prDisplayValue = vars.prDisplay;
+  self.historyDisplayValue = vars.historyDisplay;
+
+  var path = $location.path();
+  if (path.length > 0) {
+      switch (path) {
+      case "/prs":
+	  self.selected=0;
+	  break;
+      case "/queue":
+	  self.selected=1;
+	  break;
+      case "/history":
+	  self.selected=2;
+	  break;
+      case "/e2e":
+	  self.selected=3;
+	  break;
+      case "/users":
+	  self.selected=4;
+	  break;
+      case "/bot":
+	  self.selected=5;
+	  break;
+      default:
+	  console.log("unknown path: " + path);
+	  break;
+      }
+  }
 
   // Refresh data every 10 minutes
   refreshPRs();
@@ -106,15 +136,16 @@ function SQCntl(dataService, $interval, $location) {
   function getE2E(builds) {
     var result = [];
     var failedBuild = false;
-    angular.forEach(builds, function(value, key) {
+    angular.forEach(builds, function(job, key) {
       var obj = {
-        'name': key
+        'name': key,
+        'id': job.ID,
       };
-      if (value == 'Stable') {
+      if (job.Status == 'Stable') {
         // green check mark
         obj.state = '\u2713';
         obj.color = 'green';
-      } else if (value == 'Not Stable') {
+      } else if (job.Status == 'Not Stable') {
         // red X mark
         obj.state = '\u2716';
         obj.color = 'red';
@@ -122,7 +153,7 @@ function SQCntl(dataService, $interval, $location) {
       } else {
         obj.state = 'Error';
         obj.color = 'red';
-        obj.msg = value;
+        obj.msg = job.Status;
         failedBuild = true;
       }
       result.push(obj);
@@ -211,6 +242,10 @@ function SQCntl(dataService, $interval, $location) {
   function goToPerson(person) {
     console.log(person);
     window.location.href = 'https://github.com/' + person;
+  }
+
+  function selectTab(tabName) {
+    self.location.path('/' + tabName);
   }
 }
 

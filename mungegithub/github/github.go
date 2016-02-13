@@ -21,6 +21,7 @@ import (
 	goflag "flag"
 	"fmt"
 	"io/ioutil"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -189,7 +190,9 @@ type analytics struct {
 	ClosePR           analytic
 	OpenPR            analytic
 	GetContents       analytic
+	ListComments      analytic
 	CreateComment     analytic
+	DeleteComment     analytic
 	Merge             analytic
 	GetUser           analytic
 }
@@ -215,7 +218,9 @@ func (a analytics) print() {
 	fmt.Fprintf(w, "ClosePR\t%d\t\n", a.ClosePR.Count)
 	fmt.Fprintf(w, "OpenPR\t%d\t\n", a.OpenPR.Count)
 	fmt.Fprintf(w, "GetContents\t%d\t\n", a.GetContents.Count)
+	fmt.Fprintf(w, "ListComments\t%d\t\n", a.ListComments.Count)
 	fmt.Fprintf(w, "CreateComment\t%d\t\n", a.CreateComment.Count)
+	fmt.Fprintf(w, "DeleteComment\t%d\t\n", a.DeleteComment.Count)
 	fmt.Fprintf(w, "Merge\t%d\t\n", a.Merge.Count)
 	fmt.Fprintf(w, "GetUser\t%d\t\n", a.GetUser.Count)
 	w.Flush()
@@ -372,12 +377,50 @@ func (config *Config) SetClient(client *github.Client) {
 	config.client = client
 }
 
-// GetObject will return an object (with only the issue filled in)
-func (config *Config) GetObject(num int) (*MungeObject, error) {
+func (config *Config) getPR(num int) (*github.PullRequest, error) {
+	pr, response, err := config.client.PullRequests.Get(config.Org, config.Project, num)
+	config.analytics.GetPR.Call(config, response)
+	if err != nil {
+		glog.Errorf("Error getting PR# %d: %v", num, err)
+		return nil, err
+	}
+	return pr, nil
+}
+
+func (config *Config) getIssue(num int) (*github.Issue, error) {
 	issue, resp, err := config.client.Issues.Get(config.Org, config.Project, num)
 	config.analytics.GetIssue.Call(config, resp)
 	if err != nil {
-		glog.Errorf("GetObject: %v", err)
+		glog.Errorf("getIssue: %v", err)
+		return nil, err
+	}
+	return issue, nil
+}
+
+// Refresh will refresh the Issue (and PR if this is a PR)
+// (not the commits or events)
+func (obj *MungeObject) Refresh() error {
+	num := *obj.Issue.Number
+	issue, err := obj.config.getIssue(num)
+	if err != nil {
+		return err
+	}
+	obj.Issue = issue
+	if !obj.IsPR() {
+		return nil
+	}
+	pr, err := obj.config.getPR(*obj.Issue.Number)
+	if err != nil {
+		return err
+	}
+	obj.pr = pr
+	return nil
+}
+
+// GetObject will return an object (with only the issue filled in)
+func (config *Config) GetObject(num int) (*MungeObject, error) {
+	issue, err := config.getIssue(num)
+	if err != nil {
 		return nil, err
 	}
 	obj := &MungeObject{
@@ -385,6 +428,20 @@ func (config *Config) GetObject(num int) (*MungeObject, error) {
 		Issue:  issue,
 	}
 	return obj, nil
+}
+
+// IsForBranch return true if the object is a PR for a branch with the given
+// name. It return false if it is not a pr, it isn't against the given branch,
+// or we can't tell
+func (obj *MungeObject) IsForBranch(branch string) bool {
+	pr, err := obj.GetPR()
+	if err != nil {
+		return false
+	}
+	if pr.Base != nil && pr.Base.Ref != nil && *pr.Base.Ref == branch {
+		return true
+	}
+	return false
 }
 
 // LastModifiedTime returns the time the last commit was made
@@ -537,6 +594,26 @@ func (obj *MungeObject) RemoveLabel(label string) error {
 		return err
 	}
 	return nil
+}
+
+// Priority returns the priority an issue was labeled with.
+// The labels must take the form 'priority/P?[0-9]+'
+// or math.MaxInt32 if unset
+func (obj *MungeObject) Priority() int {
+	priority := math.MaxInt32
+	priorityLabels := GetLabelsWithPrefix(obj.Issue.Labels, "priority/")
+	for _, label := range priorityLabels {
+		label = strings.TrimPrefix(label, "priority/")
+		label = strings.TrimPrefix(label, "P")
+		prio, err := strconv.Atoi(label)
+		if err != nil {
+			continue
+		}
+		if prio < priority {
+			priority = prio
+		}
+	}
+	return priority
 }
 
 // MungeFunction is the type that must be implemented and passed to ForEachIssueDo
@@ -871,21 +948,7 @@ func (obj *MungeObject) GetCommits() ([]github.RepositoryCommit, error) {
 	return filledCommits, nil
 }
 
-// RefreshPR will get the PR again, in case anything changed since last time
-func (obj *MungeObject) RefreshPR() (*github.PullRequest, error) {
-	config := obj.config
-	issueNum := *obj.Issue.Number
-	pr, response, err := config.client.PullRequests.Get(config.Org, config.Project, issueNum)
-	config.analytics.GetPR.Call(config, response)
-	if err != nil {
-		glog.Errorf("Error getting PR# %d: %v", issueNum, err)
-		return nil, err
-	}
-	obj.pr = pr
-	return pr, nil
-}
-
-// GetPR will update the PR in the object.
+// GetPR will return the PR of the object.
 func (obj *MungeObject) GetPR() (*github.PullRequest, error) {
 	if obj.pr != nil {
 		return obj.pr, nil
@@ -893,7 +956,12 @@ func (obj *MungeObject) GetPR() (*github.PullRequest, error) {
 	if !obj.IsPR() {
 		return nil, fmt.Errorf("Issue: %d is not a PR", *obj.Issue.Number)
 	}
-	return obj.RefreshPR()
+	pr, err := obj.config.getPR(*obj.Issue.Number)
+	if err != nil {
+		return nil, err
+	}
+	obj.pr = pr
+	return pr, nil
 }
 
 // AssignPR will assign `prNum` to the `owner` where the `owner` is asignee's github login
@@ -1026,6 +1094,32 @@ func (obj *MungeObject) MergePR(who string) error {
 	return nil
 }
 
+// ListComments returns all comments for the issue/PR in question
+func (obj *MungeObject) ListComments(number int) ([]github.IssueComment, error) {
+	config := obj.config
+	issueNum := *obj.Issue.Number
+	allComments := []github.IssueComment{}
+
+	listOpts := &github.IssueListCommentsOptions{}
+
+	page := 1
+	for {
+		listOpts.ListOptions.Page = page
+		glog.V(8).Infof("Fetching page %d of comments for issue %d", page, issueNum)
+		comments, response, err := obj.config.client.Issues.ListComments(config.Org, config.Project, issueNum, listOpts)
+		config.analytics.ListComments.Call(config, response)
+		if err != nil {
+			return nil, err
+		}
+		allComments = append(allComments, comments...)
+		if response.LastPage == 0 || response.LastPage <= page {
+			break
+		}
+		page++
+	}
+	return allComments, nil
+}
+
 // WriteComment will send the `msg` as a comment to the specified PR
 func (obj *MungeObject) WriteComment(msg string) error {
 	config := obj.config
@@ -1037,6 +1131,27 @@ func (obj *MungeObject) WriteComment(msg string) error {
 	}
 	if _, _, err := config.client.Issues.CreateComment(config.Org, config.Project, prNum, &github.IssueComment{Body: &msg}); err != nil {
 		glog.Errorf("%v", err)
+		return err
+	}
+	return nil
+}
+
+// DeleteComment will remove the specified comment
+func (obj *MungeObject) DeleteComment(comment *github.IssueComment) error {
+	config := obj.config
+	prNum := *obj.Issue.Number
+	config.analytics.DeleteComment.Call(config, nil)
+	if comment.ID == nil {
+		err := fmt.Errorf("Found a comment with nil id for Issue %d", prNum)
+		glog.Errorf("Found a comment with nil id for Issue %d", prNum)
+		return err
+	}
+	glog.Infof("Removing comment %d from Issue %d", *comment.ID, prNum)
+	if config.DryRun {
+		return nil
+	}
+	if _, err := config.client.Issues.DeleteComment(config.Org, config.Project, *comment.ID); err != nil {
+		glog.Errorf("Error removing comment: %v", err)
 		return err
 	}
 	return nil
@@ -1059,7 +1174,12 @@ func (obj *MungeObject) IsMergeable() (bool, error) {
 		glog.V(4).Infof("Waiting for mergeability on %q %d", *pr.Title, *pr.Number)
 		// TODO: determine what a good empirical setting for this is.
 		time.Sleep(2 * time.Second)
-		pr, err = obj.RefreshPR()
+		err := obj.Refresh()
+		if err != nil {
+			glog.Errorf("Unable to refresh PR# %d: %v", prNum, err)
+			return false, err
+		}
+		pr, err = obj.GetPR()
 		if err != nil {
 			glog.Errorf("Unable to get PR# %d: %v", prNum, err)
 			return false, err

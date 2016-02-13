@@ -11,6 +11,7 @@ dont-require-e2e-label
 dry-run
 e2e-status-context
 election-namespace
+enable-output-coloring
 error-page
 etcd-prefix
 etcd-server
@@ -27,6 +28,7 @@ issue-reports
 jenkins-host
 jenkins-jobs
 last-release-pr
+left-build-number
 max-pr-number
 min-pr-number
 network-config
@@ -37,11 +39,13 @@ rate-limit
 rate-limit-burst
 relnote-filter
 required-contexts
+right-build-number
 running-in-cluster
 shame-cc
 shame-from
 shame-report-cmd
 source-file
+start-from
 stats-port
 sync-period
 tcp-services
@@ -58,4 +62,6 @@ watch-namespace
 whitelist-override-label
 configuration-name
 custom-error-service
-
+use-unicast
+ssl-ca-cert
+ssl-cert

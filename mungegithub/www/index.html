@@ -2,7 +2,7 @@
 <html lang="en">
 
 <head>
-  <link rel="stylesheet" href="https://ajax.googleapis.com/ajax/libs/angular_material/1.0.0-rc4/angular-material.min.css" type="text/css">
+  <link rel="stylesheet" href="https://ajax.googleapis.com/ajax/libs/angular_material/1.0.3/angular-material.min.css" type="text/css">
   <link rel="stylesheet" href="md-data-table.min.css" type="text/css">
   <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=RobotoDraft:300,400,500,700,400italic" type="text/css">
   <link rel="stylesheet" href="style.css" type="text/css">
@@ -25,9 +25,9 @@
         <h2 class="md-toolbar-tools">E2E Tests Failing. Entire Submit Queue Blocked.</h2>
       </md-toolbar>
       <md-content class="md-padding">
-        <md-tabs md-dynamic-height md-border-bottom>
+        <md-tabs md-selected="cntl.selected" md-dynamic-height md-border-bottom>
 
-          <md-tab label="PR's">
+          <md-tab label="PR's" md-on-select="cntl.selectTab('prs')">
             <md-content class="md-padding">
               <md-content class="md-whiteframe-z2">
                 <md-toolbar>
@@ -62,7 +62,7 @@
             </md-content>
           </md-tab>
 
-          <md-tab label="Queue">
+          <md-tab label="Queue" md-on-select="cntl.selectTab('queue')">
             <md-content class="md-padding">
               <md-toolbar class="md-whiteframe-z2">
                 <h2 class="md-toolbar-tools">Queued For Retest And Merge<span id="queue-len" ng-show="cntl.e2equeue.length > 0"></span></h2>
@@ -85,7 +85,7 @@
               <section>
                 <md-subheader class="md-primary">QUEUE</md-subheader>
                 <md-list layout-padding>
-                  <md-list-item class="md-2-line" ng-repeat="pr in cntl.e2equeue | orderBy: 'Number' track by pr.Number">
+                  <md-list-item class="md-2-line" ng-repeat="pr in cntl.e2equeue track by pr.Number">
                     <a class="md-avatar" ng-href="https://github.com/kubernetes/kubernetes/pulls/{{pr.Login}}">
                       <img ng-src="{{pr.AvatarURL}}" alt="{{pr.Login}}">
                     </a>
@@ -101,7 +101,7 @@
             </md-content>
           </md-tab>
 
-          <md-tab label="History">
+          <md-tab label="History" md-on-select="cntl.selectTab('history')">
             <md-content class="md-padding">
               <md-content class="md-whiteframe-z2">
                 <md-toolbar>
@@ -136,7 +136,7 @@
             </md-content>
           </md-tab>
 
-          <md-tab>
+          <md-tab md-on-select="cntl.selectTab('e2e')">
             <md-tab-label>
               <span ng-class="{'redTab':cntl.failedBuild}">Google Internal E2E</span>
             </md-tab-label>
@@ -147,7 +147,7 @@
                 </md-toolbar>
                 <md-chips ng-model="cntl.builds" readonly="true">
                   <md-chip-template title="{{$chip.msg}}">
-                    <span style="color: {{$chip.color}}">{{$chip.state}}</span> {{$chip.name}}
+                    <span style="color: {{$chip.color}}">{{$chip.state}}</span> <a ng-href="https://storage.cloud.google.com/kubernetes-jenkins/logs/{{$chip.name}}/{{$chip.id}}/">{{$chip.name}}</a>
                     <span style="color: {{$chip.color}}">{{$chip.msg}}</span>
                   </md-chip-template>
                 </md-chips>
@@ -155,7 +155,7 @@
             </md-tab-body>
           </md-tab>
 
-          <md-tab label="Users">
+          <md-tab label="Users" md-on-select="cntl.selectTab('users')">
             <md-content class="md-padding">
               <md-toolbar class="md-whiteframe-z2">
                 <h2 class="md-toolbar-tools">Users</h2>
@@ -172,7 +172,7 @@
             </md-content>
           </md-tab>
 
-          <md-tab label="Bot Info">
+          <md-tab label="Bot Info" md-on-select="cntl.selectTab('bot')">
             <md-content class="md-padding">
               <md-content class="md-whiteframe-z2">
                 <md-toolbar>
@@ -215,10 +215,10 @@
     </md-content>
   </md-content>
   <!-- Angular Material Dependencies -->
-  <script src="https://ajax.googleapis.com/ajax/libs/angularjs/1.4.8/angular.min.js" type="text/javascript"></script>
-  <script src="https://ajax.googleapis.com/ajax/libs/angularjs/1.4.8/angular-animate.min.js" type="text/javascript"></script>
-  <script src="https://ajax.googleapis.com/ajax/libs/angularjs/1.4.8/angular-aria.min.js" type="text/javascript"></script>
-  <script src="https://ajax.googleapis.com/ajax/libs/angular_material/1.0.0-rc4/angular-material.min.js" type="text/javascript"></script>
+  <script src="https://ajax.googleapis.com/ajax/libs/angularjs/1.4.9/angular.min.js" type="text/javascript"></script>
+  <script src="https://ajax.googleapis.com/ajax/libs/angularjs/1.4.9/angular-animate.min.js" type="text/javascript"></script>
+  <script src="https://ajax.googleapis.com/ajax/libs/angularjs/1.4.9/angular-aria.min.js" type="text/javascript"></script>
+  <script src="https://ajax.googleapis.com/ajax/libs/angular_material/1.0.3/angular-material.min.js" type="text/javascript"></script>
   <script src="md-data-table.min.js" type="text/javascript"></script>
   <script src="toArrayFilter.js" type="text/javascript"></script>
   <script src="script.js" type="text/javascript"></script>
