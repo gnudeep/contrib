@@ -42,7 +42,7 @@ http {
 
   server {
     listen 80;
-    server_name newapps.cloudstaging.wso2.com;
+    server_name services.cloud.wso2.com;
 
 {{range $ing := .Items}}
 {{range $rule := $ing.Spec.Rules}}
